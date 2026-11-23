@@ -1,0 +1,545 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# XFCE4 Launcher Utility for Termux
+# Provides easy management of XFCE4 desktop sessions
+#
+# Usage: start-xfce4 [OPTIONS]
+#   --help, -h           Show this help message
+#   --check, -c          Check if X server is running and show status
+#   --display DISPLAY    Set DISPLAY variable (default: :0)
+#   --xserver CMD        Specify X server command (default: termux-x11 :0)
+#   --no-xserver         Don't start X server, assume it's running
+#   --wayland            Start XFCE4 on Wayland (requires labwc)
+#   --with-ck            Start with ConsoleKit session
+#   --kill               Kill existing XFCE4 session
+#   --restart            Restart XFCE4 session
+#   --debug              Enable debug output
+#
+# Examples:
+#   start-xfce4                    # Start XFCE4 with auto-detected X server
+#   start-xfce4 --display :1       # Use display :1
+#   start-xfce4 --wayland          # Start on Wayland
+#   start-xfce4 --check            # Check status
+#   start-xfce4 --kill             # Kill session
+#   start-xfce4 --restart          # Restart session
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default values
+DISPLAY_NUM=":0"
+XSERVER_CMD="termux-x11"
+START_XSERVER=true
+USE_WAYLAND=false
+WITH_CK=false
+DEBUG=false
+ACTION="start"
+
+# Function to print colored output
+log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+log_debug() { if [[ "$DEBUG" == true ]]; then echo -e "${BLUE}[DEBUG]${NC} $*"; fi }
+
+# Show help
+show_help() {
+    cat << 'EOF'
+XFCE4 Launcher Utility for Termux
+
+Usage: start-xfce4 [OPTIONS]
+
+Options:
+  --help, -h           Show this help message
+  --check, -c          Check if X server is running and show status
+  --display DISPLAY    Set DISPLAY variable (default: :0)
+  --xserver CMD        Specify X server command (default: termux-x11 :0)
+  --no-xserver         Don't start X server, assume it's running
+  --wayland            Start XFCE4 on Wayland (requires labwc)
+  --with-ck            Start with ConsoleKit session
+  --kill               Kill existing XFCE4 session
+  --restart            Restart XFCE4 session
+  --debug              Enable debug output
+
+Examples:
+  start-xfce4                    # Start XFCE4 with auto-detected X server
+  start-xfce4 --display :1       # Use display :1
+  start-xfce4 --wayland          # Start on Wayland
+  start-xfce4 --check            # Check status
+  start-xfce4 --kill             # Kill session
+  start-xfce4 --restart          # Restart session
+
+Environment Variables:
+  DISPLAY            X display to use (default: :0)
+  XSERVER_CMD        X server command (default: termux-x11 :0)
+  XFCE4_DEBUG        Enable debug output (1/0)
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            --check|-c)
+                ACTION="check"
+                shift
+                ;;
+            --display)
+                DISPLAY_NUM="$2"
+                shift 2
+                ;;
+            --xserver)
+                XSERVER_CMD="$2"
+                shift 2
+                ;;
+            --no-xserver)
+                START_XSERVER=false
+                shift
+                ;;
+            --wayland)
+                USE_WAYLAND=true
+                shift
+                ;;
+            --with-ck)
+                WITH_CK=true
+                shift
+                ;;
+            --kill)
+                ACTION="kill"
+                shift
+                ;;
+            --restart)
+                ACTION="restart"
+                shift
+                ;;
+            --debug)
+                DEBUG=true
+                shift
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    # Override from env
+    if [[ -n "${DISPLAY:-}" ]]; then
+        DISPLAY_NUM="$DISPLAY"
+    fi
+    if [[ -n "${XSERVER_CMD:-}" ]]; then
+        XSERVER_CMD="$XSERVER_CMD"
+    fi
+    if [[ "${XFCE4_DEBUG:-0}" == "1" ]]; then
+        DEBUG=true
+    fi
+}
+
+# Check if X server is running and actually accepting connections
+check_xserver() {
+    local display="$1"
+    local d="${display#:}"
+    d="${d%%.*}"
+
+    # A real X connection is the only reliable check
+    if command -v xprop >/dev/null 2>&1; then
+        timeout 2 xprop -display "$display" -root >/dev/null 2>&1 && return 0
+    elif command -v xwininfo >/dev/null 2>&1; then
+        timeout 2 xwininfo -display "$display" -root >/dev/null 2>&1 && return 0
+    elif command -v xdpyinfo >/dev/null 2>&1; then
+        timeout 2 xdpyinfo -display "$display" >/dev/null 2>&1 && return 0
+    fi
+
+    # Fallback: TCP check (port 6000 + display number)
+    local port=$((d + 6000))
+    if timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check XFCE4 session status
+check_session() {
+    log_info "Checking XFCE4 session status..."
+    
+    # Check DISPLAY and auto-detect from running X server
+    if [[ -z "${DISPLAY:-}" ]]; then
+        if pgrep -f "termux-x11" >/dev/null 2>&1; then
+            DISPLAY=":0"
+            DISPLAY_NUM=":0"
+            log_info "Auto-detected DISPLAY=:0 (from running termux-x11)"
+        else
+            DISPLAY="$DISPLAY_NUM"
+        fi
+    else
+        # DISPLAY is already set, sync DISPLAY_NUM
+        DISPLAY_NUM="$DISPLAY"
+        log_info "DISPLAY is set to: $DISPLAY"
+    fi
+    
+    # Check X server
+    if check_xserver "$DISPLAY_NUM"; then
+        log_success "X server is running on $DISPLAY_NUM"
+    else
+        log_warn "X server is NOT running on $DISPLAY_NUM"
+    fi
+    
+    # Check XFCE4 processes
+    local xfce_pids=$(pgrep -f "xfce4-session|startxfce4" 2>/dev/null || true)
+    if [[ -n "$xfce_pids" ]]; then
+        log_info "XFCE4 processes found:"
+        ps -fp $xfce_pids 2>/dev/null || true
+    else
+        log_info "No XFCE4 processes running"
+    fi
+    
+    # Check X server processes
+    local xserver_pids=$(pgrep -f "termux-x11|Xwayland|Xorg" 2>/dev/null || true)
+    if [[ -n "$xserver_pids" ]]; then
+        log_info "X server processes found:"
+        ps -fp $xserver_pids 2>/dev/null || true
+    fi
+    
+    # Check environment
+    log_info "Environment:"
+    log_debug "  XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset}"
+    log_debug "  XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-unset}"
+    log_debug "  DESKTOP_SESSION=${DESKTOP_SESSION:-unset}"
+    log_debug "  XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}"
+    log_debug "  DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
+}
+
+# Check whether an XFCE4 session is already running on this display
+session_running() {
+    local pid want="${DISPLAY_NUM%%.*}"
+    for pid in $(pgrep -x xfce4-session 2>/dev/null); do
+        if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+            | grep -Fxq -e "DISPLAY=$want" -e "DISPLAY=$want.0"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Kill XFCE4 session
+kill_session() {
+    log_info "Killing XFCE4 session..."
+    
+    # Kill XFCE4 processes
+    local xfce_pids=$(pgrep -f "xfce4-session|startxfce4|xfce4-panel|xfce4-terminal|xfce4-settings|xfwm4|xfdesktop|thunar" 2>/dev/null || true)
+    if [[ -n "$xfce_pids" ]]; then
+        log_info "Killing XFCE4 processes: $xfce_pids"
+        kill $xfce_pids 2>/dev/null || true
+        sleep 1
+        # Force kill if still running
+        local remaining=$(pgrep -f "xfce4-session|startxfce4|xfce4-panel|xfce4-terminal|xfce4-settings|xfwm4|xfdesktop|thunar" 2>/dev/null || true)
+        if [[ -n "$remaining" ]]; then
+            log_warn "Force killing remaining processes: $remaining"
+            kill -9 $remaining 2>/dev/null || true
+        fi
+        log_success "XFCE4 processes killed"
+    else
+        log_info "No XFCE4 processes to kill"
+    fi
+    
+    # Optionally kill X server (commented out by default)
+    # log_info "Killing X server processes..."
+    # pkill -f "termux-x11|Xwayland|Xorg" 2>/dev/null || true
+}
+
+# Start X server
+start_xserver() {
+    if [[ "$START_XSERVER" != true ]]; then
+        log_info "Skipping X server startup (--no-xserver)"
+        return 0
+    fi
+    
+    log_info "Starting X server: $XSERVER_CMD $DISPLAY_NUM"
+    
+    # Check if already running
+    if check_xserver "$DISPLAY_NUM"; then
+        log_warn "X server already running on $DISPLAY_NUM"
+        return 0
+    fi
+
+    # Remove stale lock/socket left by a crashed X server
+    local d="${DISPLAY_NUM#:}"
+    local tmpdir="${TMPDIR:-${PREFIX:-/data/data/com.termux/files/usr}/tmp}"
+    d="${d%%.*}"
+    if [[ -e "$tmpdir/.X${d}-lock" || -S "$tmpdir/.X11-unix/X${d}" ]]; then
+        log_warn "Removing stale X lock/socket for $DISPLAY_NUM"
+        rm -f "$tmpdir/.X${d}-lock" "$tmpdir/.X11-unix/X${d}"
+    fi
+
+    # Start X server in background
+    case "$XSERVER_CMD" in
+        termux-x11)
+            # termux-x11 needs to be started properly
+            if command -v termux-x11 >/dev/null 2>&1; then
+                termux-x11 "$DISPLAY_NUM" &
+                XSERVER_PID=$!
+                log_debug "Started termux-x11 with PID $XSERVER_PID"
+            else
+                log_error "termux-x11 not found. Install with: pkg install termux-x11"
+                return 1
+            fi
+            ;;
+        *)
+            # Custom X server command
+            eval "$XSERVER_CMD $DISPLAY_NUM" &
+            XSERVER_PID=$!
+            log_debug "Started custom X server with PID $XSERVER_PID"
+            ;;
+    esac
+    
+    # Wait for X server to be ready
+    local retries=30
+    while [[ $retries -gt 0 ]]; do
+        if check_xserver "$DISPLAY_NUM"; then
+            log_success "X server is ready on $DISPLAY_NUM"
+            return 0
+        fi
+        sleep 0.5
+        ((retries--))
+    done
+    
+    log_error "X server failed to start on $DISPLAY_NUM"
+    return 1
+}
+
+# Fall back to Adwaita if the selected icon theme is incomplete
+check_icon_theme() {
+    local theme theme_dir="" dirs d
+    theme=$(xfconf-query -c xsettings -p /Net/IconThemeName 2>/dev/null || true)
+    [[ -z "$theme" ]] && return 0
+    for theme_dir in "$HOME/.local/share/icons/$theme" "${PREFIX:-/data/data/com.termux/files/usr}/share/icons/$theme"; do
+        [[ -f "$theme_dir/index.theme" ]] && break
+        theme_dir=""
+    done
+    [[ -z "$theme_dir" ]] && return 0
+    dirs=$(sed -n 's/^Directories=//p' "$theme_dir/index.theme" | tr ',' ' ')
+    for d in $dirs; do
+        if [[ ! -d "$theme_dir/$d" ]]; then
+            log_warn "Icon theme '$theme' is incomplete, falling back to Adwaita"
+            xfconf-query -c xsettings -p /Net/IconThemeName -s Adwaita 2>/dev/null || true
+            return 0
+        fi
+    done
+}
+
+# Disable xfce4-power-manager when UPower is not usable (Termux/Android)
+check_power_manager() {
+    local autostart="$XDG_CONFIG_HOME/autostart/xfce4-power-manager.desktop"
+    if dbus-send --system --print-reply --dest=org.freedesktop.UPower \
+        /org/freedesktop/UPower org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; then
+        if [[ -f "$autostart" ]] && grep -q 'Managed by start-xfce4' "$autostart" 2>/dev/null; then
+            rm -f "$autostart"
+        fi
+        return 0
+    fi
+    mkdir -p "$(dirname "$autostart")"
+    if [[ ! -e "$autostart" ]] || grep -q 'Managed by start-xfce4' "$autostart" 2>/dev/null; then
+        printf '%s\n' \
+            '[Desktop Entry]' \
+            'Type=Application' \
+            'Name=Power Manager' \
+            'Comment=Managed by start-xfce4' \
+            'Hidden=true' > "$autostart"
+        log_debug "UPower unavailable; xfce4-power-manager disabled"
+    fi
+}
+
+# Migrate XDG dirs/bookmarks that still point to a regular Linux home
+fix_paths() {
+    mkdir -p "$HOME/Documents" "$HOME/Music" "$HOME/Pictures" "$HOME/Videos" \
+             "$HOME/Downloads" "$HOME/Templates" "$HOME/Public" "$HOME/Desktop"
+
+    local cfg="$XDG_CONFIG_HOME/user-dirs.dirs"
+    if [[ ! -f "$cfg" ]] || grep -q '/home/' "$cfg" 2>/dev/null; then
+        cat > "$cfg" <<EOF
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+EOF
+    fi
+
+    local bookmarks="$XDG_CONFIG_HOME/gtk-3.0/bookmarks"
+    if [[ -f "$bookmarks" ]] && grep -q 'file:///home/' "$bookmarks" 2>/dev/null; then
+        sed -i -E "s#file:///home/[^/]+/#file://$HOME/#g" "$bookmarks"
+    fi
+}
+
+# Apply the wallpaper to every connected monitor/workspace
+apply_wallpaper() {
+    local img="$HOME/.local/share/wallpapers/tokyo-night.jpg"
+    [[ -f "$img" ]] || return 0
+    local outputs=() out ws
+    if command -v xrandr >/dev/null 2>&1; then
+        while read -r out; do
+            [[ -n "$out" ]] && outputs+=("$out")
+        done < <(xrandr --query 2>/dev/null | awk '/ connected/{print $1}')
+    fi
+    [[ ${#outputs[@]} -eq 0 ]] && outputs=(builtin)
+    for out in "${outputs[@]}"; do
+        for ws in 0 1 2 3; do
+            xfconf-query -c xfce4-desktop -p "/backdrop/screen0/monitor${out}/workspace${ws}/last-image" \
+                -n -t string -s "$img" >/dev/null 2>&1 || true
+            xfconf-query -c xfce4-desktop -p "/backdrop/screen0/monitor${out}/workspace${ws}/image-style" \
+                -n -t int -s 5 >/dev/null 2>&1 || true
+        done
+    done
+}
+
+# Setup environment for XFCE4
+setup_environment() {
+    export DISPLAY="$DISPLAY_NUM"
+    
+    # XDG variables
+    export XDG_MENU_PREFIX="xfce-"
+    export DESKTOP_SESSION="xfce"
+    export XDG_CURRENT_DESKTOP="XFCE"
+    export XDG_SESSION_DESKTOP="xfce"
+    
+    # Config directories
+    export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+    export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+    export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/runtime}"
+    
+    # Ensure directories exist
+    mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+    chmod 700 "$XDG_RUNTIME_DIR"
+    
+    # XDG data/config dirs
+    export XDG_DATA_DIRS="/data/data/com.termux/files/usr/share:/usr/local/share:/usr/share"
+    export XDG_CONFIG_DIRS="/etc/xdg:/data/data/com.termux/files/usr/etc/xdg"
+    
+    # Wayland specific
+    if [[ "$USE_WAYLAND" == true ]]; then
+        export XDG_SESSION_TYPE="wayland"
+        export GDK_BACKEND="wayland,x11"
+        export QT_QPA_PLATFORM="wayland"
+        export CLUTTER_BACKEND="gdk"
+        export MOZ_ENABLE_WAYLAND="1"
+    fi
+    
+    # D-Bus
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        log_debug "Starting D-Bus session..."
+        eval "$(dbus-launch --exit-with-session --sh-syntax 2>/dev/null)" || log_warn "Failed to start D-Bus session"
+    fi
+
+    # System D-Bus (needed by xfdesktop, xfce4-power-manager, etc.)
+    local system_socket="${PREFIX:-/data/data/com.termux/files/usr}/var/run/dbus/system_bus_socket"
+    if ! dbus-send --system --print-reply --dest=org.freedesktop.DBus \
+        /org/freedesktop/DBus org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+        log_debug "Starting D-Bus system bus..."
+        rm -f "$system_socket" "$(dirname "$system_socket")/pid"
+        dbus-daemon --system --fork 2>/dev/null || log_warn "Failed to start D-Bus system bus"
+    fi
+
+    # xfce4-session's ssh-agent needs this directory to exist
+    if [[ -d "$HOME/.ssh" ]]; then
+        mkdir -p "$HOME/.ssh/agent"
+        chmod 700 "$HOME/.ssh/agent"
+    fi
+
+    fix_paths
+    check_icon_theme
+    check_power_manager
+    apply_wallpaper
+    
+    log_debug "Environment setup complete"
+    log_debug "  DISPLAY=$DISPLAY"
+    log_debug "  XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-unset}"
+    log_debug "  DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unset}"
+}
+
+# Start XFCE4 session
+start_xfce4() {
+    log_info "Starting XFCE4 session on $DISPLAY_NUM..."
+    
+    # Build startxfce4 arguments
+    local startxfce4_args=()
+    if [[ "$WITH_CK" == true ]]; then
+        startxfce4_args+=(--with-ck-launch)
+    fi
+    if [[ "$USE_WAYLAND" == true ]]; then
+        startxfce4_args+=(--wayland)
+    fi
+    
+    # Export XFCE4 session compositor if wayland
+    if [[ "$USE_WAYLAND" == true ]]; then
+        export XFCE4_SESSION_COMPOSITOR=1
+    fi
+    
+    log_debug "Executing: startxfce4 ${startxfce4_args[*]}"
+    
+    # Start XFCE4
+    if [[ "$USE_WAYLAND" == true ]]; then
+        # For Wayland, startxfce4 handles the compositor
+        exec startxfce4 "${startxfce4_args[@]}"
+    else
+        # For X11, startxfce4 will start X server if needed
+        exec startxfce4 "${startxfce4_args[@]}"
+    fi
+}
+
+# Main function
+main() {
+    parse_args "$@"
+    
+    log_debug "Action: $ACTION"
+    log_debug "Display: $DISPLAY_NUM"
+    log_debug "X Server: $XSERVER_CMD"
+    log_debug "Start X Server: $START_XSERVER"
+    log_debug "Wayland: $USE_WAYLAND"
+    log_debug "ConsoleKit: $WITH_CK"
+    
+    case "$ACTION" in
+        check)
+            check_session
+            ;;
+        kill)
+            kill_session
+            ;;
+        restart)
+            kill_session
+            sleep 2
+            start_xserver
+            setup_environment
+            start_xfce4
+            ;;
+        start|*)
+            if session_running; then
+                log_warn "XFCE4 session is already running on this display"
+                log_info "Use 'start-xfce4 --restart' to restart it"
+                exit 0
+            fi
+            start_xserver
+            setup_environment
+            start_xfce4
+            ;;
+    esac
+}
+
+# Run main
+main "$@"
